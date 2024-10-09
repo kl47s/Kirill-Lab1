@@ -1,0 +1,59 @@
+import pandas as pd
+from openpyxl import load_workbook
+!pip install openpyxl
+import openpyxl
+
+!wget  -O 'название файла xlsx'
+data = pd.read_excel('название файла xlsx')
+data
+
+sorted_data_asc = data.sort_values(by="Год начала модели", ascending=True)
+sorted_data_asc
+
+workbook = load_workbook('base_demo.xlsx')
+sheet = workbook['cars-base.ru']  # В данном файле это имя листа если использовали другой файл то имя будет другое.
+rows_to_delete = [572,571,179,176,177]  # Список номеров строк, которые нужно удалить
+for row_number in sorted(rows_to_delete, reverse=True):
+    sheet.delete_rows(row_number)
+workbook.save('base_new.xlsx')
+
+#Выводим Строки с опр.Элементом
+data.loc[data[input("Введите столбец: ")] == input("Введите элемент из таблицы: ")] #На месте Марка(1) любой столбец из Таблицы. На месте AC(2) любой элемент из таблицы
+print(data)
+
+#Вывод машин с прошедшым гарантийным сроком
+# Загрузка данных из таблицы Excel
+df = pd.read_excel("base_demo.xlsx")
+# Фильтрация машин, созданных до 2000 года
+filtered_df = df[df["Год начала поколения"] < 2000]
+filtered_df
+
+data2 = load_workbook('base_demo.xlsx') # Это исходная таблица, но можете выбрать 'base_new.xlsx' которую мы создавали для сохранения изменний в предыдущей функции.
+sheet = data2.active # Выбираем активный лист
+new_row=('AA', 'AA', 'AA', 'Да') #Даём информацию для новой строки, значения могут быть любые, но знайте (,) разделяет значения по столбцам
+sheet.append(new_row)
+data2.save('base_new.xlsx') #Откройте файл base.xlsx и убедитесь что строка под этим номером пропала и была автоматически заменена соседом рядом
+
+# Заменяем значения в любой строке и любом столбце
+data3 = openpyxl.load_workbook('base_demo.xlsx') #Это исходная таблица, но можете выбрать 'base_new.xlsx'
+worksheet = data3['cars-base.ru']
+row_index=2 #Указываем строку в котой хотим вносить изменения
+worksheet.cell(row=row_index, column=6).value = 'ACE' # с помощбю "column=6" Указываем столбец в которой хотим вносить изменения
+data3.save('base_new.xlsx')
+
+df = pd.read_excel('base_demo.xlsx') #Это исходная таблица, но можете выбрать 'base_new.xlsx'
+value_to_delete = input('Введите элемент: ') #Введите условие по которму функция будет удалять строки
+df = df[df[input('Введите Столбец: ')] != value_to_delete] #Введите столбец впределах которого функция будет удалять строки
+df.to_excel('base_new.xlsx', index=False)
+
+wb = load_workbook('base_demo.xlsx') # Загрузка файла Excel
+ws = wb.active  # Выбор активного листа
+columns_to_delete = []  # Список для хранения столбцов, которые нужно удалить
+for column in range(1, ws.max_column + 1): # Перебор столбцов по индексу (начиная с 1)
+    column_values = [cell.value for cell in ws[column] if cell.value] # Проверка, есть ли значения в столбце
+    if len(column_values) == 0:
+        columns_to_delete.append(column)
+for column in reversed(columns_to_delete):# Удаление столбцов, начиная с последнего, чтобы избежать сдвига индексов
+    ws.delete_cols(column)
+
+wb.save('base_new.xlsx')

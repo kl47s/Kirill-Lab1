@@ -1,0 +1,690 @@
+
+# In[10]:
+
+
+import random
+import numpy as np
+import torch
+import torchvision as tv
+import collections
+import os
+import re
+
+import matplotlib.pyplot as plt
+from scipy import ndimage
+from scipy import misc
+from nltk.translate.bleu_score import corpus_bleu
+
+from tqdm import tqdm
+from torch.nn.utils.rnn import pack_padded_sequence
+from torchvision import transforms as T
+from PIL import Image
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+get_ipython().run_line_magic('matplotlib', 'inline')
+get_ipython().system('nvidia-smi')
+# In[11]:
+
+
+# Данная ячейка загружает изображения
+#!wget http://images.cocodataset.org/zips/val2014.zip
+#!unzip val2014.zip
+
+
+# In[12]:
+
+
+# Данная ячейка загружает описания к изображениям
+#!wget http://images.cocodataset.org/annotations/annotations_trainval2014.zip
+#!unzip annotations_trainval2014.zip
+
+
+# Выделим фичи изображений с помощью сверточной части ResNet34. Выходной слой сверточной части с помошью flattern представим в вектор и будем это уже использовать далее.
+# 
+# Мы будем передавать изображения из MSCOCO через ResNet. Вместо того, чтобы просматривать выходные данные Resnet  после «softmax» операции, мы собираемся просмотреть слой непосредственно перед этим.
+
+# In[13]:
+
+
+model = tv.models.resnet34(pretrained=True)
+model.eval()
+
+
+# In[14]:
+
+
+num_features = model.fc.in_features
+print('Число фичей из одной фотки:', num_features)
+model.fc = torch.nn.Identity()  # заменяем полносвязный слой на слой-тождественность
+
+
+# Проверка выхода сети при подаче батча = 1 и фотки 3,224,224
+
+# In[15]:
+
+
+test_tensor = torch.rand(1, 3, 224, 224)
+out = model(test_tensor)
+print(out.shape)
+
+
+# In[16]:
+
+
+# Заморозка модели
+for param in model.parameters():
+    param.requires_grad = False
+
+
+# In[17]:
+
+
+TRAIN_IMAGE_PATH = 'val2014'
+ANNOTATION_PATH = 'annotations/captions_val2014.json'
+
+# Создадим трансформации к изображениям:
+transform = T.Compose([T.Resize(256), 
+                       T.CenterCrop(224), 
+                       T.ToTensor(), 
+                       T.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])])
+
+# Создадим датасет:
+dataset = tv.datasets.CocoCaptions(TRAIN_IMAGE_PATH, ANNOTATION_PATH, transform)
+
+
+# In[18]:
+
+
+print('Количество изображений в выборке: ', len(dataset))
+
+
+# ## Кодируем наши подписи и устанавливаем лимит словаря
+# 
+# При использовании горячего кодирования длина вектора каждого слова равна количеству слов в словаре. Давайте ограничим размер наших обучающих данных, удалив редкие слова.
+# 
+# Увидем что хранится в датасете:
+
+# In[19]:
+
+
+dataset[1]
+
+
+# Это кортеж, в которм фотка и список с возможными описаниями этого изображения
+# 
+# Разделим по пробелам все слова в датасете и получим массив в котором каждое слово отдельный элемент. Это мы делаем для создания словаря и понимания часто встречаемых и редко встречаемых слов
+
+# Функция по предподготовке текстовых данных: (Убирает ненужные символы и приводит к нижнему регистру)
+
+# In[20]:
+
+
+def process_word_list(word_list):
+    processed_list = []
+    for word in word_list:
+        # Приводим слово к нижнему регистру
+        word = word.lower()
+        # Удаляем все символы, кроме букв
+        word = re.sub(r'[^a-zA-Z]', '', word)
+        # Добавляем обработанное слово в список
+        processed_list.append(word)
+    return processed_list
+
+
+# In[21]:
+
+
+##Составим список всех предложений.
+DatasetWordList=[]
+for _, dataset_caption in dataset:
+        DatasetWordList += process_word_list(str(dataset_caption).split())
+
+
+# In[22]:
+
+
+print('столько слов обнаружил в созданном списке:', len(DatasetWordList))
+
+
+# Получили словарь со словами и количеством их встреч в датасете:
+
+# In[23]:
+
+
+#Определить количество различных слов
+distinctwords = collections.Counter(DatasetWordList)
+
+# Вывести только первые 7 элементов словаря
+keys = list(distinctwords.keys())[:7]
+values = list(distinctwords.values())[:7]
+for i in range(len(keys)):
+    print(keys[i], values[i])
+print('...')
+
+#Отсортируем
+count_pairs = sorted(distinctwords.items(), key=lambda x: (-x[1], x[0])) #ascending order (возрастающий порядок)
+
+
+# Получим список слов и отберем слова у которых встречаемость более 5 раз в датасете
+# Так же добавим отдельные значения BOS старта и EOS конца текста, PAD паддинга и UNK для замены тех слов что нет в словаре
+
+# In[24]:
+
+
+# Выделим отдельно слова и значения частоты встречаемости этого слова
+words, occurence = list(zip(*count_pairs))
+print('occurence =', occurence[:15])
+print('words = ', words[:15])
+print('было значений:', len(words))
+
+
+# In[25]:
+
+
+DictionaryLength = occurence.index(5)  #индекс для слов, которые встречаются 5 раз и больше
+words=['PAD','UNK','EOS','BOS'] + list(words)[:DictionaryLength]
+word_to_id = dict(zip(words, range(len(words))))
+print('words = ', words[:15])
+print('стало значений с учетом + 4 новых кодов (РАЗМЕР СЛОВАРЯ):', len(words))
+
+
+# Получили для кажого слова свой новый индекс:
+
+# In[28]:
+
+
+# Вывести только первые 8 элементов словаря word_to_id
+keys = list(word_to_id.keys())[:10]
+values = list(word_to_id.values())[:10]
+print('word_to_id словарь:')
+for i in range(len(keys)):
+    print(keys[i], values[i])
+print('...')
+
+
+# Трансформация из исходного предложения:
+
+# Было:
+
+# In[48]:
+
+
+dataset[0][1][1].split()
+
+
+# После функции перевода в lower и убирания лишних символов:
+
+# In[46]:
+
+
+process_word_list(dataset[0][1][1].split())
+
+
+# После кодировния согласно словарю стало:
+
+# In[52]:
+
+
+[word_to_id[word] for word in process_word_list(dataset[0][1][1].split()) if word in word_to_id]
+
+
+# Мы выбираем случайное предложение с описанием для каждой фотографии. Ограничиваем размер предложения в 20 слов, заставляя остальное паддингами. Добавляем в конце EOS
+
+# In[78]:
+
+
+num_steps=20  # максимальный размер предложения на train
+
+# Функция для даталоадера. На вход пришел массив размером batch_size из значений из датасета
+def collate_sentences(list_data):
+    images = []
+    labels = []
+    lens = []
+    references = []
+    for sample in list_data:
+        image, label_ = sample
+        label = random.choice(label_) #выбор случайного предложения из массива
+        images.append(image)
+        lens.append(len(label.split()) if len(label.split()) < num_steps else num_steps)  #длина предложения
+
+        # Получим кодировку слов как в словаре и в конце добавим код EOS
+        EmbeddedSentence=[word_to_id[word] for word in process_word_list(label.split()) if word in word_to_id]+[word_to_id['EOS']]
+        
+        # Заполняем паддингами короткие предложения после их окончания 
+        if len(EmbeddedSentence)<num_steps:
+            b=[word_to_id['PAD']] * num_steps
+            b[:len(EmbeddedSentence)] = EmbeddedSentence
+
+        # Если более длинное, то просто обрезаем
+        elif len(EmbeddedSentence) > num_steps:
+            b=EmbeddedSentence[:num_steps]
+        else:
+            b=EmbeddedSentence
+
+        # Переводим в тензор:
+        labels.append(torch.LongTensor(b))
+        
+        ref=[]
+        for i in range(5):
+            ref.append(process_word_list(label_[i].split()))
+        references.append(ref)
+
+    lens, indices = torch.sort(torch.LongTensor(lens), descending=True)
+    images = torch.index_select(torch.stack(images), 0, indices)
+    labels = torch.index_select(torch.stack(labels), 0, indices)
+   
+
+    return images, labels, lens, references
+
+
+# __images__ - батч из изображений (batch_size, 3, 224, 224)<br>
+# __labels__ - батч описаний (batch_size, num_steps) ,
+# где num_steps-максимальная длина предложения<br>
+# __lens__ - длина каждого предложения в виде тензора (batch_size)<br>
+# __references__ - 5 реальных предложений для каждого из элементов батча (все референсные предложения). Данный список участвует в расчете метрики corpus_blue. Так как размер может различаться поэтому в качестве list<br>
+
+# Cледующая ячейка объединяет в даталоудере несколько семплов из датасета в один батч. Пример батча из 4 фоток:
+
+# In[79]:
+
+
+a, b, c, d =collate_sentences([dataset[0], dataset[1], dataset[2], dataset[3]])
+print(a.shape)
+print(b.shape)
+print(c.shape)
+print(len(d))
+
+
+# Мы взяли уже готовую архитектуру для выделения фич из изображений и теперь создадим архитектуру которая по ним будем создавать текст с помощью LSTM ячеек:
+
+# Берем текст и приводим каждое слово с помощью Embedding в размерность feature_dim. Далее на выходе LSTM с сети с числом слоев num_layers получаем на финальной 20 позиции текста интересующий нас результат размерности num_hidden. Потом этот результат подаем на перцептрон с выходом размерностью слов в словаре - классификатор с большим числом вариантов Linear(num_hidden, dict_size)
+
+# In[4]:
+
+
+class LLMModel(torch.nn.Module):
+    def __init__(self, dict_size, input_dim, feature_dim, output_keep_prob, num_layers, num_hidden):
+        super().__init__()
+        self.embed = torch.nn.Embedding(dict_size, feature_dim)
+        self.feature_dim = feature_dim
+        self.lstm_cell = torch.nn.LSTM(feature_dim,
+                                       batch_first=True,
+                                       hidden_size=num_hidden, 
+                                       num_layers=num_layers, 
+                                       dropout=output_keep_prob)
+        self.linear = torch.nn.Linear(num_hidden, dict_size)
+    def forward(self, x, feature):
+        '''
+        x - описание картинки [batch_size, max_len_text], где max_len_text - длина максимальной последовательности (num_steps)
+        feature - фичи после обработки CNN [batch_size, feature_dim]
+        '''
+        x = self.embed(x)
+        # Получу [batch_size, max_len_text, feature_dim] - {word indices представление}
+
+        # feature.unsqueeze(1) #Input: [batch_size, feature_dim], Output: [batch_size, 1, feature_dim]
+        x = torch.cat([feature.unsqueeze(1), x], dim=1)[:,:-1,:] 
+        # Мы сконкатиноровали: Input: [batch_size, 1, feature_dim] {image vector}, [batch_size, T, feature_dim] {word indices} 
+        # Output: [batch_size, 1+max_len_text-1, feature_dim]
+
+
+        o, _ = self.lstm_cell(x) # выход [batch_size, 1+max_len_text-1, num_hidden]
+        return self.linear(o) #[BOS, 14, 25, 87, 34, EOS, PAD, PAD...] ideal case #[batch_size, max_len_text+1, dict_size]
+
+
+# Теперь мы будем обучать нашу LM. Мы будем использовать метод,  где на каждом временном шаге мы будем передавать RNN текущую подпись **И** вектор признаков изображения путем объединения каждый новый вход с вектором признаков.
+
+# Задание лосса:
+
+# ### Задание лосса и параметров модели
+
+# In[98]:
+
+
+#######################################################################################################
+# Параметры
+feature_dim = 512 #ResNet измененный мной
+num_hidden = 300
+num_steps = num_steps
+dict_length = len(words)
+batch_size = 100
+num_layers = 3
+#######################################################################################################
+train_loader = torch.utils.data.DataLoader(dataset, batch_size, 
+                                           shuffle=True, 
+                                           collate_fn=collate_sentences,
+                                           drop_last=True
+                                          )
+
+llm_model = LLMModel(len(word_to_id), feature_dim, feature_dim, 0.05, num_layers, num_hidden)
+lr = 1e-3
+optimizer = torch.optim.Adam(llm_model.parameters(), lr)
+loss_func = torch.nn.CrossEntropyLoss(reduction="sum")
+
+device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+print(device)
+llm_model.to(device)
+model.to(device)
+EPOCHS = 10
+
+def accuracy(scores, targets, k):
+    """
+    Computes top-k accuracy, from predicted and true labels.
+    :param scores: scores from the model
+    :param targets: true labels
+    :param k: k in top-k accuracy
+    :return: top-k accuracy
+    Средний по батчу accuracy предикта нужного слова в 1-5 наивысших скорах
+    """
+
+    batch_size = targets.size(0)
+    _, ind = scores.topk(k, 1, True, True)
+    correct = ind.eq(targets.view(-1, 1).expand_as(ind))
+    correct_total = correct.view(-1).float().sum()  
+    return correct_total.item() * (100.0 / batch_size)
+
+
+# Метрика Corpus BLEU (Bilingual Evaluation Understudy) является одной из самых популярных метрик для оценки качества машинного перевода. Она основывается на сравнении машинного перевода с несколькими референсными переводами, которые были выполнены людьми. 
+# 
+# Алгоритм метрики Corpus BLEU вычисляет сходство между машинным переводом и каждым референсным переводом, используя простой алгоритм подсчета n-граммов (последовательностей из n слов). Затем, для каждого n-грамма, вычисляется количество вхождений этого n-грамма в машинный и референсный переводы. 
+# 
+# Далее, вычисляется точность (precision) машинного перевода для каждого n-грамма, как отношение количества вхождений данного n-грамма в машинный перевод к общему количеству вхождений этого n-грамма во всех переводах (машинных и референсных). 
+# 
+# Наконец, для получения общей метрики Corpus BLEU, вычисляется геометрическое среднее точности машинного перевода для всех n-граммов, с учетом длины машинного перевода и количества референсных переводов. 
+# 
+# Метрика Corpus BLEU позволяет оценить качество машинного перевода на уровне слов и фраз, а также учитывает разнообразие референсных переводов. Она широко используется в научных работах и соревнованиях по машинному переводу.
+# 
+# В нашем случае будем учитывать 5 референсных текстов правильного описания 
+
+# ## Обучение модели:
+
+# In[99]:
+
+
+model.eval()
+llm_model.train()
+for ep in range(EPOCHS):
+    print(f'Началось обучение {ep+1} эпохи')
+    loader = tqdm(enumerate(train_loader))
+    for idx, data in loader:
+        image, label, lens, references = data
+        image, label = image.to(device), label.to(device)
+        
+        #Создадим вектор об изображении
+        with torch.no_grad():
+            feature = model(image)
+        
+        optimizer.zero_grad()
+
+        # Добавление 'BOS' в начало предложения:
+        start_symbol = label.new_full((label.size(0), 1), word_to_id['BOS'])
+        # Данной строчкой мы нашли код [3] для BOS и получили его batch_size раз 
+
+        input_label = torch.cat([start_symbol, label],dim=-1)[:,:num_steps]
+        # Тут мы вставили +1 BOS символ в начало строки и отрезали конечный символ строки
+        # стал размер [batch_size, 1+20-1] то есть исходный по итогу
+      
+        out = llm_model(input_label, feature)
+        ''' 
+        на выходе forward для каждого элемента батча [20, dict_size] размер выхода. Мы используем подход 
+        teacher forcing тем самы каждое новое слово на этапе n предсказывается при знании n-1 
+        реальных ответов, прошедших через lstm. При этом для генерации первого слова BOS используется 
+        лишь знание о фичах изображения из ResNet
+        '''
+
+        scores = pack_padded_sequence(
+            out, lens, batch_first=True
+        ) # delete [PAD, PAD] чтоб честно считать лосс
+        targets = pack_padded_sequence(
+            input_label, lens, batch_first=True
+        )
+
+        # Calculate loss
+        loss = loss_func(scores.data, targets.data)
+        loss.backward()
+
+        # Предотвращение Exploiding gradient (взрыва градиентов)
+        torch.nn.utils.clip_grad_norm_(llm_model.parameters(), 5) #обрезка значений по величину=5
+        optimizer.step()
+        
+        # Оценка accuracy по топ_К=5
+        if idx % 150==0: # каждый сотый батч печатаем резы
+            #top_k
+            topk = accuracy(scores.data, targets.data, 5)
+            
+            #corpus_bleu метрика
+            #candidates for corpus_bleu
+            candidates=[]
+            for i in range(len(label)):
+                sentence=[words[ind] for ind in torch.argmax(out[i],dim=-1)]
+                sentence_before_EOS = []
+                # Отрежем стартовое слово и слова после EOS
+                for word in sentence:
+                    if (word == 'EOS') or (word == 'PAD'):
+                        break
+                    if word == 'BOS':
+                        continue
+                    else:
+                        sentence_before_EOS.append(word)
+                candidates.append(sentence_before_EOS)
+            score = corpus_bleu(references, candidates)
+            print(f"iteration: {idx+ep*len(train_loader)} loss: {loss.item()} topk: {topk} corpus_bleu: {score}")
+    print('Конец обучения эпохи')
+print('СЕТЬ ОБУЧЕНА')
+
+
+# Количество градиентных спусков на 1 эпоху:
+
+# In[100]:
+
+
+len(train_loader)
+
+
+# Сохраним модель и загрузим ее:
+
+# In[5]:
+
+
+torch.save(llm_model, 'model.pt')
+llm_model = torch.load('model.pt')
+model = tv.models.resnet34(pretrained=True)
+model.fc = torch.nn.Identity()  # заменяем полносвязный слой на слой-тождественность
+
+
+# Выход каждого объекта в батче слудующий:
+
+# In[102]:
+
+
+out[0].shape
+
+
+# Вот как получить значение самого вероятного слова в каждый момент времени: <br>
+# PS: Данный номер согласно словарю можно перевести в конкретное слово по ключу
+
+# In[103]:
+
+
+torch.argmax(out[25],dim=1)
+
+
+# __Посмотрим на результаты обучения.__  <br>Ячейка ниже показывает подпись к изображению. В данном случае мы видим не целиком собственное сочинение нейросетью а лишь генерацию каждого следующего слова N при подаче на вход реального предложения c N-1 числом слов. Так что результирующий предикт может быть грамматически несвязанным, так как он не учитывает свои предыдущие шаги генерации для выдачи нового слова
+
+# In[104]:
+
+
+batch_id = 32
+Prediction=' '.join([words[ind] for ind in torch.argmax(out[batch_id],dim=-1)])
+Gt=' '.join([words[ind] for ind in label[batch_id]])
+
+plt.title('Prediction: '+ Prediction+'\n Gt: '+Gt)
+plt.imshow(image[batch_id].permute(1,2,0).cpu())
+plt.show()
+
+
+# In[112]:
+
+
+batch_id = 11
+Prediction=' '.join([words[ind] for ind in torch.argmax(out[batch_id],dim=-1)])
+Gt=' '.join([words[ind] for ind in label[batch_id]])
+
+plt.title('Prediction: '+ Prediction+'\n Gt: '+Gt)
+plt.imshow(image[batch_id].permute(1,2,0).cpu())
+plt.show()
+
+
+# In[116]:
+
+
+batch_id = 4
+Prediction=' '.join([words[ind] for ind in torch.argmax(out[batch_id],dim=-1)])
+Gt=' '.join([words[ind] for ind in label[batch_id]])
+
+plt.title('Prediction: '+ Prediction+'\n Gt: '+Gt)
+plt.imshow(image[batch_id].permute(1,2,0).cpu())
+plt.show()
+
+
+# Проверим на валидационной выборке
+
+# In[117]:
+
+
+val_dataset = dataset
+val_loader = torch.utils.data.DataLoader(val_dataset, 1, 
+                                           shuffle=True, 
+                                           collate_fn=collate_sentences
+                                          )
+
+
+# In[118]:
+
+
+model.eval()
+llm_model.eval()
+
+loader = tqdm(enumerate(val_loader))
+
+topks = []
+for idx, data in loader:
+    if idx<1000:
+        image, label, lens, references = data
+        image, label = image.to(device), label.to(device)
+        with torch.no_grad():
+            feature = model(image)
+
+        start_symbol = label.new_full((label.size(0),1),word_to_id['BOS'])
+        input_label = torch.cat([start_symbol, label],dim=-1)[:,:num_steps]
+
+        out = llm_model(input_label, feature)
+        scores = pack_padded_sequence(
+            out, lens, batch_first=True
+        )
+        targets = pack_padded_sequence(
+            label, lens, batch_first=True
+        )
+
+        topk = accuracy(scores.data, targets.data, 5)
+        topks.append(topk)
+        loader.set_description(f"iteration: {idx}") 
+    else:
+        break
+
+
+# In[119]:
+
+
+print(f'Mean TopK: {np.mean(topks)}%') 
+
+
+# __Попытка написать текст с нуля по новой фотке.__ <br>Вот алгоритм:
+
+# 
+# <div style="text-align:center;">
+#   <img src="https://drive.google.com/uc?id=1fnJ7zgSuXBjurRHGtJkirbqNpmZPewvs" alt="bot" width="1000" height="443">
+
+# In[6]:
+
+
+def generate_new(index=1):
+    llm_model.eval()
+    model.eval()
+
+    # создаю путь к изображению
+    image_path = f"val2014/{os.listdir('val2014')[index]}"
+
+    # получение индекса по слову
+    rev_word_map = {id: word for id, word in enumerate(words)}
+
+    # считывание и трансформация 
+    img = Image.open(image_path).convert('RGB')
+    img = transform(img)    # (3, 224, 224)
+
+    # Получим фичи из изображения
+    encoder_image = model(img.unsqueeze(0).to(device))
+
+    # LLM init
+    # Инициализировал LSTM подав изображение
+    step = 1
+    h, c = llm_model.lstm_cell(encoder_image)
+    # в с хранится текущее состояние рекуррентной LSTM ячейки 
+    # (будет перезаписываться при прогоне)
+
+    #Зададим первого слово BOS для первичного прогона:
+    prev_words = torch.tensor([[word_to_id['BOS']]], dtype=torch.long).to(device)  
+    seqs = prev_words   # размерность (1, 1)
+
+    max_steps = 30  # Максимальный размер генерации если не будет EOS
+    # цикл генерации
+    while True:
+        # Повторяем весь код инференса из llm модели (forward)
+        embeddings = llm_model.embed(prev_words).squeeze(1)  # (1, embed_dim)
+        # Мы текущее слово преставили в виде набора embed_dim чисел с 
+        # помощью обученного слоя эмбеддинга
+
+        # Прогон слова через LSTM с состоянием с
+        h, c = llm_model.lstm_cell(embeddings, c)
+        # Мы перезаписали на текущий момент состояние памяти с и получили output h
+        # h имеет размер - [1, 256]
+
+        # Прогон через линейный слой
+        scores = llm_model.linear(h) # размерность [1, 11683]
+        
+        # С помошью greedy алгоритма берем самый вероятный предикт
+        next_word_inds = torch.argmax(scores[0],dim=-1).unsqueeze(0)
+
+        # Добавляем новое слово к уже сочиненным
+        seqs = torch.cat([seqs, next_word_inds.unsqueeze(0)], dim=1)  # (1, step + 1)
+
+        # Проверка на конец EOS для досрочного конца цикла:
+        if next_word_inds[0] == word_to_id['EOS']:
+            break
+
+        # Выход по превышению лимита генерации
+        if step > max_steps:
+            break
+
+        # Заменим текцих новый ответ на предыдущий для реализации новой генерации
+        prev_words = next_word_inds
+        step += 1
+
+    # Превращаем сгенерированную последовательность в текст    
+    seq = seqs[0].tolist()
+    caption = [rev_word_map[ind] for ind in seq]
+
+    # Выводим изображение и как подпись результат генерации:
+    img = Image.open(image_path).convert('RGB')
+    plt.title(f'Prediction: {" ".join(caption)}')
+    plt.imshow(img)
+
+
+# In[146]:
+
+
+generate_new(4)
+
+
